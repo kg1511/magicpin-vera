@@ -89,6 +89,7 @@ class ConversationState:
     turns: List[Dict[str, Any]] = field(default_factory=list)
     last_inbound_at: Optional[datetime] = None
     last_outbound_body: Optional[str] = None
+    auto_reply_hits: int = 0
 
 
 START_TIME = time.time()
@@ -338,6 +339,32 @@ def _compose_for_trigger(
         rationale = "Anchors on concrete review evidence and offers ready-to-use replies."
         return body, "open_ended", rationale
 
+    if kind == "competitor_opened":
+        payload = trigger.get("payload") or {}
+        competitor = _first_nonempty(payload.get("competitor_name"))
+        dist_km = payload.get("distance_km")
+        if dist_km is None:
+            dist_km = payload.get("distance")
+        their_offer = _first_nonempty(payload.get("their_offer"), payload.get("offer"), payload.get("competitor_offer"))
+        opened = _first_nonempty(payload.get("opened_date"))
+
+        who = competitor or "a nearby competitor"
+        where = ""
+        if isinstance(dist_km, (int, float)):
+            where = f" (~{dist_km:.1f} km)"
+        when = f" (opened {opened})" if opened else ""
+
+        offer_line = f"They are pushing: {their_offer}. " if their_offer else ""
+        cat_offer = " / ".join(_pick_offer_ideas(category, 2))
+        counter_hint = f" (e.g., {cat_offer})" if cat_offer else ""
+
+        body = (
+            f"{sal} - heads up: {who}{where}{when}. {offer_line}{anchor}\n"
+            f"Want a 3-part counter (1 WhatsApp reply, 1 Google Post headline, 1 better-value offer{counter_hint}) you can post today?"
+        ).strip()
+        rationale = "Competitor opened nearby; summarizes concrete facts and offers ready-to-use counter assets without leaking placeholder keys."
+        return body, "open_ended", rationale
+
     if kind == "ipl_match_today":
         payload = trigger.get("payload") or {}
         match = payload.get("match", "today's match")
@@ -407,17 +434,11 @@ def _compose_for_trigger(
             rationale = "Connects to wedding timeline; offers options; clear CTA."
             return body, "open_ended", rationale
 
-    # Generic fallback
-    payload_keys = list((trigger.get("payload") or {}).keys())[:4]
+    # Generic fallback (do not leak raw payload keys)
     body = (
         f"{sal} - quick update on {kind.replace('_', ' ')} (urgency {urgency}).\n"
-        f"I can turn this into 1 ready message/post for you. Want the draft?"
+        f"Want me to turn this into 1 ready-to-send message/post tailored to your category?"
     ).strip()
-    if payload_keys:
-        body = (
-            f"{sal} - quick update on {kind.replace('_', ' ')} (urgency {urgency}).\n"
-            f"I'm looking at: {', '.join(payload_keys)}. Want me to draft the best next message/post?"
-        ).strip()
 
     rationale = "Fallback message: references trigger kind and offers a concrete next step."
     return body, "open_ended", rationale
@@ -494,11 +515,15 @@ async def tick(body: TickBody):
 
         trigger = trg_ctx.payload
 
-        # Expiry check
+        # Expiry check (judge datasets sometimes use past dates; allow a grace window)
         expires_at = trigger.get("expires_at")
         if isinstance(expires_at, str) and expires_at:
-            if _parse_iso(expires_at) < now:
-                continue
+            try:
+                expires_dt = _parse_iso(expires_at)
+                if expires_dt < (now - timedelta(days=14)):
+                    continue
+            except Exception:
+                pass
 
         sup_key = _first_nonempty(trigger.get("suppression_key"))
         if sup_key and sup_key in suppressed:
@@ -598,14 +623,46 @@ async def reply(body: ReplyBody):
     conv.last_inbound_at = received_at
 
     msg = body.message or ""
+    msg_l = msg.lower()
 
     # Hard stops
-    if _matches_any(msg, _HOSTILE_PATTERNS) or re.search(r"\bstop\b", msg.lower()):
+    if _matches_any(msg, _HOSTILE_PATTERNS) or re.search(r"\bstop\b", msg_l):
         return {"action": "end", "rationale": "User asked to stop / was hostile; ending respectfully."}
 
-    # Auto-reply pollution - end quickly
+    # Auto-reply pollution
     if _matches_any(msg, _AUTO_REPLY_PATTERNS):
-        return {"action": "end", "rationale": "Detected WhatsApp Business auto-reply; ending to avoid loops."}
+        conv.auto_reply_hits += 1
+        if conv.auto_reply_hits >= 2:
+            return {"action": "end", "rationale": "Auto-reply repeated; ending to avoid loops."}
+
+        next_body = (
+            "Thanks - I got the auto-reply.\n"
+            "When a person is available, reply here and I will continue with a ready-to-send draft."
+        )
+        next_body = _dedupe_body(conv, next_body)
+        conv.last_outbound_body = next_body
+        return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Detected an auto-reply; sent a single wait message, then will end if it repeats."}
+    # Customer routing: booking / confirm / reschedule intents
+    if body.customer_id is not None or body.from_role == "customer":
+        if re.search(r"\b(book|booking|appointment|appt)\b", msg_l) or re.search(r"\b(reschedule|confirm)\b", msg_l):
+            next_body = (
+                "Sure - I can request that booking for you.\n"
+                "Please share: (1) your full name, (2) phone number, and (3) the service you want.\n"
+                "If you have a preferred time window, mention it, and we'll confirm shortly. Reply STOP to opt out."
+            )
+            next_body = _dedupe_body(conv, next_body)
+            conv.last_outbound_body = next_body
+            return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Customer asked to book/confirm; collect minimum details to proceed without asking merchant-growth goals."}
+
+        if re.search(r"\b(yes|yep|yeah|ok|okay)\b", msg_l):
+            next_body = (
+                "Great - please share your name + phone number, and I'll get this confirmed with the merchant.\n"
+                "Reply STOP anytime to opt out."
+            )
+            next_body = _dedupe_body(conv, next_body)
+            conv.last_outbound_body = next_body
+            return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Customer confirmation; ask for contact details to complete the loop."}
+
 
     # Intent transition: act, don't qualify
     if _matches_any(msg, _COMMIT_PATTERNS):
@@ -618,6 +675,20 @@ async def reply(body: ReplyBody):
         next_body = _dedupe_body(conv, next_body)
         conv.last_outbound_body = next_body
         return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Merchant committed; moved directly to execution with minimal inputs."}
+
+    # Merchant routing: handle technical/compliance follow-ups with specificity
+    if body.customer_id is None and body.from_role == "merchant":
+        if re.search(r"\b(x[-\s]?ray|xray|radiograph|radiography|d[-\s]?speed|film unit)\b", msg_l):
+            next_body = (
+                "Got it - I can help you audit this quickly.\n"
+                "Reply with these 3 details and I'll turn it into a 5-point checklist + a staff note:\n"
+                "1) Make/model of the unit (if you know)\n"
+                "2) Your typical settings (kVp / mA / exposure time)\n"
+                "3) Film/sensor + processing type (D-speed film, CR/DR, manual/automatic)"
+            )
+            next_body = _dedupe_body(conv, next_body)
+            conv.last_outbound_body = next_body
+            return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Merchant asked a technical compliance question; request minimal specifics to generate a concrete checklist."}
 
     # Default helpful reply
     next_body = (

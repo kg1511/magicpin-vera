@@ -21,15 +21,15 @@ Author: magicpin AI Challenge Team
 # =============================================================================
 
 # Your bot's URL (where your bot is running)
-BOT_URL = "http://localhost:8081"
+BOT_URL = "https://magicpin-vera--kartikempire.replit.app"
 
-# Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
-LLM_PROVIDER = "openai"
+# Choose your LLM provider: "openai", "anthropic" (SDK), "anthropic_raw" (manual HTTP), "gemini", "deepseek", "groq", "ollama", "openrouter"
+LLM_PROVIDER = "anthropic"
 
 # Your API key (paste your key here)
 LLM_API_KEY = ""  # <-- PUT YOUR API KEY HERE
 
-# Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
+# Model to use (leave empty for default, or specify like "gpt-4o", "claude-sonnet-4-6", etc.)
 LLM_MODEL = ""  # <-- Optional: specify model or leave empty for default
 
 # For Ollama only: local server URL
@@ -55,9 +55,43 @@ from pathlib import Path
 from urllib import request as urlrequest, error as urlerror
 from abc import ABC, abstractmethod
 
+
+DEBUG_ANTHROPIC = os.getenv("DEBUG_ANTHROPIC", "").strip() in {"1", "true", "True", "yes", "YES"}
+DEBUG_GEMINI = os.getenv("DEBUG_GEMINI", "").strip() in {"1", "true", "True", "yes", "YES"}
+
 # Constants
 TIMEOUT_LLM = 45
 DATASET_DIR = Path(__file__).parent / "dataset"
+
+# =============================================================================
+# OPTIONAL: ENV VAR OVERRIDES (so you don't paste keys into this file)
+# =============================================================================
+
+# Allow simple overrides
+BOT_URL = os.getenv("BOT_URL", BOT_URL)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", LLM_PROVIDER)
+LLM_MODEL = os.getenv("LLM_MODEL", LLM_MODEL)
+OLLAMA_URL = os.getenv("OLLAMA_URL", OLLAMA_URL)
+TEST_SCENARIO = os.getenv("TEST_SCENARIO", TEST_SCENARIO)
+
+# Accept a generic key env var, plus common provider-specific ones
+LLM_API_KEY_SOURCE = "inline_config"
+for _key_name in [
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "OPENROUTER_API_KEY",
+]:
+    _v = os.getenv(_key_name)
+    if _v:
+        LLM_API_KEY = _v.strip()
+        LLM_API_KEY_SOURCE = _key_name
+        break
 
 # =============================================================================
 # TERMINAL OUTPUT
@@ -152,7 +186,7 @@ class LLMProvider(ABC):
 
 class OpenAIProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.model = model or "gpt-4o-mini"
 
     def name(self) -> str:
@@ -181,13 +215,14 @@ class OpenAIProvider(LLMProvider):
         return data["choices"][0]["message"]["content"]
 
 
-class AnthropicProvider(LLMProvider):
+class AnthropicRawProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
-        self.api_key = api_key
-        self.model = model or "claude-3-5-sonnet-20241022"
+        self.api_key = (api_key or "").strip()
+        # Note: override with env var LLM_MODEL if needed.
+        self.model = model or "claude-sonnet-4-6"
 
     def name(self) -> str:
-        return f"Anthropic ({self.model})"
+        return f"Anthropic Raw ({self.model})"
 
     def complete(self, prompt: str, system: str = None) -> str:
         body_dict = {"model": self.model, "max_tokens": 1500,
@@ -198,17 +233,88 @@ class AnthropicProvider(LLMProvider):
         req = urlrequest.Request(
             "https://api.anthropic.com/v1/messages",
             data=json.dumps(body_dict).encode("utf-8"),
-            headers={"x-api-key": self.api_key, "Content-Type": "application/json",
-                     "anthropic-version": "2023-06-01"}
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+                "accept": "application/json",
+                "user-agent": "magicpin-ai-challenge-judge/0.1",
+            },
         )
-        resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["content"][0]["text"]
+
+        if DEBUG_ANTHROPIC:
+            safe_headers = {k: ("<redacted>" if k.lower() in {"x-api-key", "authorization"} else v) for k, v in req.headers.items()}
+            sys.stderr.write("\n[DEBUG_ANTHROPIC] POST https://api.anthropic.com/v1/messages\n")
+            sys.stderr.write(f"[DEBUG_ANTHROPIC] headers={safe_headers}\n")
+            sys.stderr.write(f"[DEBUG_ANTHROPIC] json={json.dumps(body_dict, ensure_ascii=False)}\n\n")
+
+        try:
+            resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["content"][0]["text"]
+        except urlerror.HTTPError as e:
+            raw_bytes = b""
+            try:
+                raw_bytes = e.read() or b""
+            except Exception:
+                raw_bytes = b""
+
+            raw = raw_bytes.decode("utf-8", errors="replace") if raw_bytes else ""
+            if not raw.strip():
+                hdrs = dict(getattr(e, "headers", {}) or {})
+                raw = f"(empty body) reason={getattr(e, 'reason', None)} headers={hdrs}"
+
+            raise RuntimeError(f"Anthropic HTTP {e.code}: {raw}") from e
+
+
+class AnthropicSDKProvider(LLMProvider):
+    def __init__(self, api_key: str, model: str = ""):
+        self.api_key = (api_key or "").strip()
+        self.model = model or "claude-sonnet-4-6"
+        try:
+            import anthropic  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "Anthropic SDK not installed. Install with: pip install anthropic"
+            ) from e
+
+        self._anthropic = anthropic
+        self._client = anthropic.Anthropic(api_key=self.api_key)
+
+    def name(self) -> str:
+        return f"Anthropic SDK ({self.model})"
+
+    def complete(self, prompt: str, system: str = None) -> str:
+        req_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            req_kwargs["system"] = system
+
+        if DEBUG_ANTHROPIC:
+            sys.stderr.write("\n[DEBUG_ANTHROPIC] SDK messages.create kwargs=\n")
+            sys.stderr.write(f"[DEBUG_ANTHROPIC] {json.dumps(req_kwargs, ensure_ascii=False)}\n\n")
+
+        resp = self._client.messages.create(**req_kwargs)
+
+        # SDK returns a list of content blocks; concatenate text blocks.
+        parts: List[str] = []
+        content = getattr(resp, "content", None) or []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and block.get("text"):
+                    parts.append(str(block.get("text")))
+            else:
+                if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+                    parts.append(str(getattr(block, "text")))
+        return "".join(parts).strip()
 
 
 class GeminiProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.model = model or "gemini-1.5-flash"
 
     def name(self) -> str:
@@ -221,16 +327,40 @@ class GeminiProvider(LLMProvider):
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500}
         }).encode("utf-8")
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent?key={self.api_key}"
-        req = urlrequest.Request(url, data=body, headers={"Content-Type": "application/json"})
-        resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        def _call(api_version: str) -> str:
+            url = f"https://generativelanguage.googleapis.com/{api_version}/models/{self.model}:generateContent?key={self.api_key}"
+            if DEBUG_GEMINI:
+                sys.stderr.write(f"\n[DEBUG_GEMINI] POST {url}\n")
+                sys.stderr.write(f"[DEBUG_GEMINI] json={body.decode('utf-8', errors='replace')}\n\n")
+
+            req = urlrequest.Request(url, data=body, headers={"content-type": "application/json", "accept": "application/json"})
+            resp = urlrequest.urlopen(req, timeout=TIMEOUT_LLM)
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+        try:
+            # Prefer stable v1 endpoint; some accounts/regions may still require v1beta.
+            return _call("v1")
+        except urlerror.HTTPError as e:
+            # If the endpoint itself isn't found, fallback to v1beta.
+            if getattr(e, "code", None) == 404:
+                try:
+                    return _call("v1beta")
+                except Exception:
+                    pass
+            # Re-raise with body if available for easier debugging.
+            raw_bytes = b""
+            try:
+                raw_bytes = e.read() or b""
+            except Exception:
+                raw_bytes = b""
+            raw = raw_bytes.decode("utf-8", errors="replace") if raw_bytes else ""
+            raise RuntimeError(f"Gemini HTTP {e.code}: {raw if raw.strip() else '(empty body)'}") from e
 
 
 class DeepSeekProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.model = model or "deepseek-chat"
 
     def name(self) -> str:
@@ -255,7 +385,7 @@ class DeepSeekProvider(LLMProvider):
 
 class GroqProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.model = model or "llama-3.1-70b-versatile"
 
     def name(self) -> str:
@@ -301,7 +431,7 @@ class OllamaProvider(LLMProvider):
 
 class OpenRouterProvider(LLMProvider):
     def __init__(self, api_key: str, model: str = ""):
-        self.api_key = api_key
+        self.api_key = (api_key or "").strip()
         self.model = model or "anthropic/claude-3-haiku"
 
     def name(self) -> str:
@@ -329,7 +459,9 @@ def create_provider() -> LLMProvider:
     """Create LLM provider from configuration."""
     providers = {
         "openai": lambda: OpenAIProvider(LLM_API_KEY, LLM_MODEL),
-        "anthropic": lambda: AnthropicProvider(LLM_API_KEY, LLM_MODEL),
+        # Default Anthropic path uses the official SDK (no manual headers/request shaping).
+        "anthropic": lambda: AnthropicSDKProvider(LLM_API_KEY, LLM_MODEL),
+        "anthropic_raw": lambda: AnthropicRawProvider(LLM_API_KEY, LLM_MODEL),
         "gemini": lambda: GeminiProvider(LLM_API_KEY, LLM_MODEL),
         "deepseek": lambda: DeepSeekProvider(LLM_API_KEY, LLM_MODEL),
         "groq": lambda: GroqProvider(LLM_API_KEY, LLM_MODEL),
@@ -921,6 +1053,13 @@ class JudgeSimulator:
 
 def main():
     print_header("magicpin AI Challenge — LLM Judge")
+
+    # Safe config echo (never prints the key)
+    print_info(f"Bot URL: {BOT_URL}")
+    print_info(f"Provider: {LLM_PROVIDER} | Model: {LLM_MODEL or '<default>'}")
+    has_key = bool(LLM_API_KEY)
+    has_ws = any(ch.isspace() for ch in (LLM_API_KEY or ""))
+    print_info(f"API key set: {has_key} (source: {LLM_API_KEY_SOURCE}, contains_whitespace: {has_ws})")
 
     # Validate configuration
     if LLM_PROVIDER != "ollama" and not LLM_API_KEY:
