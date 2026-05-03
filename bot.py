@@ -90,6 +90,10 @@ class ConversationState:
     last_inbound_at: Optional[datetime] = None
     last_outbound_body: Optional[str] = None
     auto_reply_hits: int = 0
+    booking_name: Optional[str] = None
+    booking_phone: Optional[str] = None
+    booking_service: Optional[str] = None
+    booking_time: Optional[str] = None
 
 
 START_TIME = time.time()
@@ -250,9 +254,134 @@ def _customer_voice_prefix(customer_name: str, merchant_name: str) -> str:
     if cust and merch:
         return f"Hi {cust} - this is {merch}."
     if cust:
-        return f"Hi {cust}."
+        return f"Hi {cust} - this is the business."
+    if merch:
+        return f"Hi there - this is {merch}."
     # Neutral fallback (no placeholders like "Hi - this is the clinic")
     return "Hi there - this is the business."
+
+
+def _is_ack_message(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    if len(t) <= 3 and t in {"ok", "k", "kk", "thx", "ty"}:
+        return True
+    if re.search(r"\b(thanks|thank\s+you|ok(?:ay)?|cool|great|noted|received|sure)\b", t) and "?" not in t:
+        return True
+    return False
+
+
+def _extract_phone(text: str) -> str:
+    # Simple India-friendly extraction: +91XXXXXXXXXX / 10-digit numbers.
+    t = (text or "")
+    m = re.search(r"(?:\+?91[\s-]?)?([6-9]\d{9})\b", t)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"\b(\d{10})\b", t)
+    if m2:
+        return m2.group(1)
+    return ""
+
+
+def _extract_booking_time_hint(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # Common relative hints
+    m = re.search(r"\b(today|tomorrow|tmr|tonight|this\s+evening|this\s+morning)\b", t, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    # Time of day patterns: 5pm, 5:30 pm, 17:30
+    m2 = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t, flags=re.IGNORECASE)
+    if m2:
+        hh = m2.group(1)
+        mm = m2.group(2) or "00"
+        ap = m2.group(3).lower()
+        return f"{hh}:{mm} {ap}"
+    m3 = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", t)
+    if m3:
+        return m3.group(0)
+
+    # Very light capture after 'for ...' (avoid echoing long strings)
+    m4 = re.search(r"\bfor\b\s+(.{1,40})$", t, flags=re.IGNORECASE)
+    if m4:
+        hint = m4.group(1).strip().rstrip(".")
+        if hint and len(hint.split()) <= 6:
+            return hint
+    return ""
+
+
+def _extract_service_hint(category_slug: str, text: str) -> str:
+    slug = (category_slug or "").strip().lower()
+    t = (text or "").lower()
+    if not t:
+        return ""
+
+    # Keep this intentionally lightweight: detect only common service keywords.
+    catalog: Dict[str, List[str]] = {
+        "dentists": [
+            r"\b(cleaning|scale\s*&\s*polish|scaling|polish)\b",
+            r"\b(whitening|bleach(?:ing)?)\b",
+            r"\b(check\s*up|checkup|consult(?:ation)?)\b",
+            r"\b(braces|aligners|invisalign)\b",
+            r"\b(root\s*canal|rct)\b",
+            r"\b(filling|extraction)\b",
+        ],
+        "salons": [
+            r"\b(hair\s*cut|haircut|trim)\b",
+            r"\b(facial|cleanup)\b",
+            r"\b(hair\s*spa|spa)\b",
+            r"\b(manicure|pedicure)\b",
+            r"\b(wax(?:ing)?)\b",
+        ],
+        "gyms": [
+            r"\b(membership|monthly|quarterly|annual)\b",
+            r"\b(trial|free\s*trial|day\s*pass)\b",
+            r"\b(personal\s*training|pt)\b",
+            r"\b(yoga|zumba|crossfit)\b",
+        ],
+        "restaurants": [
+            r"\b(table|reservation|reserve|booking)\b",
+            r"\b(birthday|anniversary)\b",
+        ],
+        "pharmacies": [
+            r"\b(home\s*delivery|delivery)\b",
+            r"\b(pick\s*up|pickup)\b",
+        ],
+    }
+
+    patterns = catalog.get(slug) or [
+        r"\b(cleaning|whitening|haircut|membership|reservation|delivery|pickup|consultation)\b"
+    ]
+    for pat in patterns:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _looks_like_question(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if "?" in t:
+        return True
+    return bool(re.search(r"\b(how|what|when|where|which|can\s+you|could\s+you|pls|please|help)\b", t))
+
+
+def _looks_like_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    return bool(
+        re.search(
+            r"\b(send|share|draft|write|create|make|give\s+me|show\s+me|steps|checklist|templates|abstract|summary|details)\b",
+            t,
+        )
+    )
 
 
 def _compose_for_trigger(
@@ -669,10 +798,12 @@ async def reply(body: ReplyBody):
 
     # Pull names (if present) to keep replies correctly voiced.
     merchant_name = ""
+    merchant_category_slug = ""
     if body.merchant_id:
         mctx = contexts.get(("merchant", body.merchant_id))
         if mctx:
             merchant_name = _first_nonempty((mctx.payload.get("identity") or {}).get("name"))
+            merchant_category_slug = _first_nonempty(mctx.payload.get("category_slug"))
     customer_name = ""
     if body.customer_id:
         cctx = contexts.get(("customer", body.customer_id))
@@ -693,36 +824,75 @@ async def reply(body: ReplyBody):
             "wait_seconds": wait_seconds,
             "rationale": "Detected WhatsApp auto-reply; waiting to avoid loops and resume when a human responds.",
         }
-    # Customer routing: booking / confirm / reschedule intents
+    # Customer routing: always customer-facing
     if body.customer_id is not None or body.from_role == "customer":
         prefix = _customer_voice_prefix(customer_name, merchant_name)
 
-        # Try to echo back a provided slot if the customer wrote one.
-        slot_hint = ""
-        m = re.search(r"\bfor\b\s+(.{0,40})$", msg.strip(), flags=re.IGNORECASE)
-        if m:
-            slot_hint = m.group(1).strip().rstrip(".")
+        # Keep lightweight extracted state so we only ask for missing booking details.
+        if customer_name:
+            conv.booking_name = customer_name
+        extracted_phone = _extract_phone(msg)
+        if extracted_phone:
+            conv.booking_phone = extracted_phone
+        extracted_time = _extract_booking_time_hint(msg)
+        if extracted_time:
+            conv.booking_time = extracted_time
+        extracted_service = _extract_service_hint(merchant_category_slug, msg)
+        if extracted_service:
+            conv.booking_service = extracted_service
 
-        if re.search(r"\b(book|booking|appointment|appt)\b", msg_l) or re.search(r"\b(reschedule|confirm)\b", msg_l):
-            slot_line = f"I have noted: {slot_hint}.\n" if slot_hint else ""
-            next_body = (
-                f"{prefix} Sure, I can help with that booking.\n"
-                f"{slot_line}"
-                "Please confirm your phone number (and optionally the service).\n"
-                "We'll confirm shortly. Reply STOP to opt out."
-            ).strip()
+        is_booking_intent = bool(re.search(r"\b(book|booking|appointment|appt|reservation|reserve)\b", msg_l)) or bool(
+            re.search(r"\b(reschedule|confirm)\b", msg_l)
+        )
+
+        # If it's just an acknowledgement and no action is required, wait.
+        if not is_booking_intent and not _looks_like_question(msg) and _is_ack_message(msg):
+            return {"action": "wait", "wait_seconds": 600, "rationale": "No customer action required; waiting."}
+
+        if is_booking_intent:
+            missing: List[str] = []
+            if not (conv.booking_name or customer_name):
+                missing.append("name")
+            if not conv.booking_phone:
+                missing.append("phone number")
+            if not conv.booking_service:
+                missing.append("service")
+            if not conv.booking_time:
+                missing.append("preferred time")
+
+            if missing:
+                ask = " and ".join(missing) if len(missing) <= 2 else ", ".join(missing[:-1]) + ", and " + missing[-1]
+                next_body = f"{prefix} Sure - could you share your {ask}?"
+            else:
+                next_body = f"{prefix} Perfect - thanks. We'll confirm shortly."
+
             next_body = _dedupe_body(conv, next_body)
             conv.last_outbound_body = next_body
-            return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Customer asked to book/confirm; collect minimum details to proceed without asking merchant-growth goals."}
+            return {
+                "action": "send",
+                "body": next_body,
+                "cta": "open_ended",
+                "rationale": "Customer booking intent; asked only for missing details.",
+            }
 
-        if re.search(r"\b(yes|yep|yeah|ok|okay)\b", msg_l):
-            next_body = (
-                f"{prefix} Great. Please share your phone number and we'll confirm shortly.\n"
-                "Reply STOP anytime to opt out."
-            )
+        if _looks_like_question(msg):
+            next_body = f"{prefix} Happy to help - are you looking to book? If yes, what day/time works best?"
             next_body = _dedupe_body(conv, next_body)
             conv.last_outbound_body = next_body
-            return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Customer confirmation; ask for contact details to complete the loop."}
+            return {
+                "action": "send",
+                "body": next_body,
+                "cta": "open_ended",
+                "rationale": "Customer question; asked a single clarifying question.",
+            }
+
+        if _is_ack_message(msg):
+            return {"action": "wait", "wait_seconds": 600, "rationale": "No clear customer action required; waiting."}
+
+        next_body = f"{prefix} How can I help today - are you looking to book or reschedule?"
+        next_body = _dedupe_body(conv, next_body)
+        conv.last_outbound_body = next_body
+        return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Intent unclear; asked a simple clarifying question."}
 
 
     # Intent transition: act, don't qualify
@@ -739,6 +909,9 @@ async def reply(body: ReplyBody):
 
     # Merchant routing: handle technical/compliance follow-ups with specificity
     if body.customer_id is None and body.from_role == "merchant":
+        if not (_looks_like_question(msg) or _looks_like_request(msg)) and _is_ack_message(msg):
+            return {"action": "wait", "wait_seconds": 600, "rationale": "Merchant acknowledgement; waiting."}
+
         if re.search(r"\b(x[-\s]?ray|xray|radiograph|radiography|d[-\s]?speed|film unit)\b", msg_l):
             next_body = (
                 "Got it - I can help you audit this quickly.\n"
@@ -751,14 +924,88 @@ async def reply(body: ReplyBody):
             conv.last_outbound_body = next_body
             return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Merchant asked a technical compliance question; request minimal specifics to generate a concrete checklist."}
 
-    # Default helpful reply
-    next_body = (
-        "Got it. If you share one detail (goal: more calls / more walk-ins / more repeat customers), "
-        "I'll suggest the best next message + a ready-to-post draft." 
-    ).strip()
-    next_body = _dedupe_body(conv, next_body)
-    conv.last_outbound_body = next_body
-    return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Acknowledged and asked for a single clarifying detail to personalize."}
+        if _looks_like_request(msg):
+            # If this conversation is tied to a trigger, try to fulfill directly.
+            trg_id = conv.trigger_id
+            trigger = None
+            if trg_id:
+                trg_ctx = contexts.get(("trigger", trg_id))
+                trigger = trg_ctx.payload if trg_ctx else None
+
+            if trigger and trigger.get("kind") == "research_digest":
+                merchant_id = body.merchant_id or conv.merchant_id
+                merchant = None
+                if merchant_id:
+                    mctx = contexts.get(("merchant", merchant_id))
+                    merchant = mctx.payload if mctx else None
+
+                category_slug = _first_nonempty((merchant or {}).get("category_slug"), (trigger.get("payload") or {}).get("category"))
+                category = None
+                if category_slug:
+                    cctx = contexts.get(("category", category_slug))
+                    category = cctx.payload if cctx else None
+
+                top_item_id = _first_nonempty((trigger.get("payload") or {}).get("top_item_id"))
+                item = _find_digest_item(category or {}, top_item_id) if top_item_id else None
+                if item:
+                    title = _first_nonempty(item.get("title"))
+                    source = _first_nonempty(item.get("source"))
+                    trial_n = item.get("trial_n")
+                    seg = _first_nonempty(item.get("patient_segment"))
+                    summary = _first_nonempty(item.get("summary"))
+
+                    facts = []
+                    if trial_n:
+                        facts.append(f"n={trial_n}")
+                    if seg:
+                        facts.append(seg.replace("_", " "))
+                    fact_str = f" ({', '.join(facts)})" if facts else ""
+                    src_str = f"Source: {source}. " if source else ""
+
+                    next_body = (
+                        f"Done. {src_str}{title}{fact_str}.\n"
+                        f"Summary: {summary}\n"
+                        "Want me to draft (1) a short patient WhatsApp note, (2) a Google Post, or (3) both?"
+                    ).strip()
+                    next_body = _dedupe_body(conv, next_body)
+                    conv.last_outbound_body = next_body
+                    return {
+                        "action": "send",
+                        "body": next_body,
+                        "cta": "open_ended",
+                        "rationale": "Merchant requested the digest details; fulfilled using stored category+trigger context and offered next-best drafts.",
+                    }
+
+            # Generic request handling (merchant-facing)
+            next_body = (
+                "Got it - I can do that.\n"
+                "Reply with these 2 details so I can draft the right message:\n"
+                "1) What you want to send (WhatsApp reply / Google Post / offer)\n"
+                "2) Any timing or price point to mention (if any)"
+            )
+            next_body = _dedupe_body(conv, next_body)
+            conv.last_outbound_body = next_body
+            return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Merchant requested action; asked for minimal inputs to fulfill."}
+
+        # Merchant asked a question (or otherwise needs help)
+        next_body = (
+            "Got it - I can help.\n"
+            "Share 2 quick details and I'll draft next steps:\n"
+            "1) What outcome you want (more calls / more walk-ins / more repeats)\n"
+            "2) Any offer or price point to highlight (if any)"
+        )
+        next_body = _dedupe_body(conv, next_body)
+        conv.last_outbound_body = next_body
+        return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Merchant asked for help; requested minimal inputs for a practical reply."}
+
+    # Default: no reply unless action is clearly required
+    if _looks_like_question(msg):
+        next_body = "Can you share what you need help with (1 sentence)?"
+        next_body = _dedupe_body(conv, next_body)
+        conv.last_outbound_body = next_body
+        return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Intent unclear; asked a single clarifying question."}
+
+    return {"action": "wait", "wait_seconds": 600, "rationale": "No action required; waiting."}
 
 
 @app.post("/v1/teardown")
