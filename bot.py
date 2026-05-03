@@ -215,6 +215,21 @@ def _find_digest_item(category: Dict[str, Any], item_id: str) -> Optional[Dict[s
     return None
 
 
+def _business_label(category_slug: str) -> str:
+    slug = (category_slug or "").strip().lower()
+    if slug == "dentists":
+        return "clinic"
+    if slug == "pharmacies":
+        return "pharmacy"
+    if slug == "salons":
+        return "salon"
+    if slug == "gyms":
+        return "gym"
+    if slug == "restaurants":
+        return "restaurant"
+    return "business"
+
+
 def _compose_for_trigger(
     *,
     now: datetime,
@@ -395,7 +410,9 @@ def _compose_for_trigger(
     if kind in {"recall_due", "appointment_tomorrow", "wedding_package_followup"}:
         # customer-facing nudges (send as merchant_on_behalf)
         cust_name = _first_nonempty((customer or {}).get("identity", {}).get("name")) or "Hi"
-        mname = _first_nonempty((merchant or {}).get("identity", {}).get("name")) or "our clinic"
+        category_slug = _first_nonempty((merchant or {}).get("category_slug"), (category or {}).get("slug"))
+        fallback_label = _business_label(category_slug)
+        mname = _first_nonempty((merchant or {}).get("identity", {}).get("name")) or f"our {fallback_label}"
         payload = trigger.get("payload") or {}
 
         if kind == "recall_due":
@@ -407,7 +424,7 @@ def _compose_for_trigger(
             due_txt = due or "soon"
             last_txt = f"(last visit {last})" if last else ""
             body = (
-                f"Hi {cust_name} - this is {mname}. Your recall/cleaning is due around {due_txt} {last_txt}.\n"
+                f"Hi {cust_name} - this is {mname}. Your next visit is due around {due_txt} {last_txt}.\n"
                 f"If you want, I can book you in {slots_txt}. Reply YES for a slot, or STOP to opt out."
             ).strip()
             rationale = "Uses due date + slot labels; clear YES/STOP CTA; no fabricated claims."
@@ -625,6 +642,18 @@ async def reply(body: ReplyBody):
     msg = body.message or ""
     msg_l = msg.lower()
 
+    # Pull names (if present) to keep replies correctly voiced.
+    merchant_name = ""
+    if body.merchant_id:
+        mctx = contexts.get(("merchant", body.merchant_id))
+        if mctx:
+            merchant_name = _first_nonempty((mctx.payload.get("identity") or {}).get("name"))
+    customer_name = ""
+    if body.customer_id:
+        cctx = contexts.get(("customer", body.customer_id))
+        if cctx:
+            customer_name = _first_nonempty((cctx.payload.get("identity") or {}).get("name"))
+
     # Hard stops
     if _matches_any(msg, _HOSTILE_PATTERNS) or re.search(r"\bstop\b", msg_l):
         return {"action": "end", "rationale": "User asked to stop / was hostile; ending respectfully."}
@@ -632,31 +661,39 @@ async def reply(body: ReplyBody):
     # Auto-reply pollution
     if _matches_any(msg, _AUTO_REPLY_PATTERNS):
         conv.auto_reply_hits += 1
-        if conv.auto_reply_hits >= 2:
-            return {"action": "end", "rationale": "Auto-reply repeated; ending to avoid loops."}
-
-        next_body = (
-            "Thanks - I got the auto-reply.\n"
-            "When a person is available, reply here and I will continue with a ready-to-send draft."
-        )
-        next_body = _dedupe_body(conv, next_body)
-        conv.last_outbound_body = next_body
-        return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Detected an auto-reply; sent a single wait message, then will end if it repeats."}
+        # For auto-replies, don't send additional messages; back off.
+        wait_seconds = int(_clamp(600 * conv.auto_reply_hits, 600, 3600))
+        return {
+            "action": "wait",
+            "wait_seconds": wait_seconds,
+            "rationale": "Detected WhatsApp auto-reply; waiting to avoid loops and resume when a human responds.",
+        }
     # Customer routing: booking / confirm / reschedule intents
     if body.customer_id is not None or body.from_role == "customer":
+        cust_greet = f"Hi {customer_name}" if customer_name else "Hi"
+        who = merchant_name or "the clinic"
+
+        # Try to echo back a provided slot if the customer wrote one.
+        slot_hint = ""
+        m = re.search(r"\bfor\b\s+(.{0,40})$", msg.strip(), flags=re.IGNORECASE)
+        if m:
+            slot_hint = m.group(1).strip().rstrip(".")
+
         if re.search(r"\b(book|booking|appointment|appt)\b", msg_l) or re.search(r"\b(reschedule|confirm)\b", msg_l):
+            slot_line = f"I have noted: {slot_hint}.\n" if slot_hint else ""
             next_body = (
-                "Sure - I can request that booking for you.\n"
-                "Please share: (1) your full name, (2) phone number, and (3) the service you want.\n"
-                "If you have a preferred time window, mention it, and we'll confirm shortly. Reply STOP to opt out."
-            )
+                f"{cust_greet} - this is {who}. Sure, I can help with that booking.\n"
+                f"{slot_line}"
+                "Please confirm your phone number, and (optional) the service you want.\n"
+                "We will confirm shortly. Reply STOP to opt out."
+            ).strip()
             next_body = _dedupe_body(conv, next_body)
             conv.last_outbound_body = next_body
             return {"action": "send", "body": next_body, "cta": "open_ended", "rationale": "Customer asked to book/confirm; collect minimum details to proceed without asking merchant-growth goals."}
 
         if re.search(r"\b(yes|yep|yeah|ok|okay)\b", msg_l):
             next_body = (
-                "Great - please share your name + phone number, and I'll get this confirmed with the merchant.\n"
+                f"{cust_greet} - great. Please share your phone number and I will get this confirmed with {who}.\n"
                 "Reply STOP anytime to opt out."
             )
             next_body = _dedupe_body(conv, next_body)
