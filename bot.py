@@ -107,6 +107,14 @@ suppressed: set[str] = set()
 app = FastAPI()
 
 SUBMITTED_AT = _iso_utc(_utcnow())
+APP_VERSION = "0.2.0"
+
+
+def _build_version_string() -> str:
+    sha = (os.getenv("RENDER_GIT_COMMIT") or "").strip()
+    if sha:
+        return f"{APP_VERSION}+{sha[:7]}"
+    return APP_VERSION
 
 
 class ContextPushBody(BaseModel):
@@ -492,7 +500,7 @@ async def metadata():
         "model": "rules+templates",
         "approach": "rule-based composer using only pushed context (no fabrication)",
         "contact_email": "local@example.com",
-        "version": "0.1.0",
+        "version": _build_version_string(),
         "submitted_at": SUBMITTED_AT,
     }
 
