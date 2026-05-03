@@ -238,6 +238,24 @@ def _business_label(category_slug: str) -> str:
     return "business"
 
 
+def _customer_voice_prefix(customer_name: str, merchant_name: str) -> str:
+    """Return a natural customer-facing opening line.
+
+    Rules:
+    - If both names exist: "Hi Priya — this is Dr. Meera’s Dental Clinic."
+    - If missing names: use a neutral fallback; do not invent names.
+    """
+
+    cust = (customer_name or "").strip()
+    merch = (merchant_name or "").strip()
+    if cust and merch:
+        return f"Hi {cust} — this is {merch}."
+    if cust:
+        return f"Hi {cust}."
+    # Neutral fallback (no placeholders like "Hi - this is the clinic")
+    return "Hi there — this is the business."
+
+
 def _compose_for_trigger(
     *,
     now: datetime,
@@ -678,8 +696,7 @@ async def reply(body: ReplyBody):
         }
     # Customer routing: booking / confirm / reschedule intents
     if body.customer_id is not None or body.from_role == "customer":
-        cust_greet = f"Hi {customer_name}" if customer_name else "Hi"
-        who = merchant_name or "the clinic"
+        prefix = _customer_voice_prefix(customer_name, merchant_name)
 
         # Try to echo back a provided slot if the customer wrote one.
         slot_hint = ""
@@ -690,10 +707,10 @@ async def reply(body: ReplyBody):
         if re.search(r"\b(book|booking|appointment|appt)\b", msg_l) or re.search(r"\b(reschedule|confirm)\b", msg_l):
             slot_line = f"I have noted: {slot_hint}.\n" if slot_hint else ""
             next_body = (
-                f"{cust_greet} - this is {who}. Sure, I can help with that booking.\n"
+                f"{prefix} Sure, I can help with that booking.\n"
                 f"{slot_line}"
-                "Please confirm your phone number, and (optional) the service you want.\n"
-                "We will confirm shortly. Reply STOP to opt out."
+                "Please confirm your phone number (and optionally the service).\n"
+                "We'll confirm shortly. Reply STOP to opt out."
             ).strip()
             next_body = _dedupe_body(conv, next_body)
             conv.last_outbound_body = next_body
@@ -701,7 +718,7 @@ async def reply(body: ReplyBody):
 
         if re.search(r"\b(yes|yep|yeah|ok|okay)\b", msg_l):
             next_body = (
-                f"{cust_greet} - great. Please share your phone number and I will get this confirmed with {who}.\n"
+                f"{prefix} Great. Please share your phone number and we'll confirm shortly.\n"
                 "Reply STOP anytime to opt out."
             )
             next_body = _dedupe_body(conv, next_body)
