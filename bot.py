@@ -103,7 +103,6 @@ suppressed: set[str] = set()
 # FastAPI app + schemas
 # -----------------------------------------------------------------------------
 
-
 app = FastAPI()
 
 SUBMITTED_AT = _iso_utc(_utcnow())
@@ -242,18 +241,18 @@ def _customer_voice_prefix(customer_name: str, merchant_name: str) -> str:
     """Return a natural customer-facing opening line.
 
     Rules:
-    - If both names exist: "Hi Priya — this is Dr. Meera’s Dental Clinic."
+    - If both names exist: "Hi Priya - this is Dr. Meera's Dental Clinic."
     - If missing names: use a neutral fallback; do not invent names.
     """
 
     cust = (customer_name or "").strip()
     merch = (merchant_name or "").strip()
     if cust and merch:
-        return f"Hi {cust} — this is {merch}."
+        return f"Hi {cust} - this is {merch}."
     if cust:
         return f"Hi {cust}."
     # Neutral fallback (no placeholders like "Hi - this is the clinic")
-    return "Hi there — this is the business."
+    return "Hi there - this is the business."
 
 
 def _compose_for_trigger(
